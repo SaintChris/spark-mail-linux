@@ -478,6 +478,25 @@ not at one Spark bug. That is an inference, not a proven cause. With
 up to 11 minutes. `FEX_SMCCHECKS=2` made every start
 die within 40 seconds and was dropped.
 
+`--jitless` lowers the crash rate but does not end it. A later jitless
+session lost its SparkCore process 46 seconds after it started, with access
+violation `0xc0000005` reading a heap address at `Spark Desktop.exe+0x2ddc057`.
+That address lies in the same region as the first dump's fault, and the stack
+again holds only `Spark Desktop.exe` frames.
+
+**`--jitless` breaks the OAuth token request.** V8 has no WebAssembly without
+a JIT (`--wasm-jitless` is not in this build), and Node's `fetch` loads its
+HTTP parser as WebAssembly. After the Google callback arrived, the main
+process's `fetch` to the token URL failed with `fetch failed`, caused by
+`ReferenceError: WebAssembly is not defined`, about 260 ms after the call. The
+window log showed only `AuthorizationComponent: Error during mapAsync
+operation` with an empty error, and the window stayed on "Proceed in
+Browser". The same request through `session.fetch` and through `net.fetch`
+returned Google's normal HTTP 400 for a request without a code. The launcher
+now replaces the main process's global `fetch` with `net.fetch` through the
+inspector when WebAssembly is missing. Other WebAssembly users inside Spark,
+if any, stay broken.
+
 **A second Spark process kills the first.** `run-spark.sh` forwards OAuth
 callbacks by running `Spark Desktop.exe --win-open-url URL` again. Under FEX
 the first instance disappeared within 4 to 25 seconds of that second process

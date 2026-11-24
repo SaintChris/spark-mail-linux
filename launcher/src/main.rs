@@ -282,12 +282,16 @@ fn run_vm_once(
                     "Spark is ready after {} s",
                     started.elapsed().as_secs()
                 ));
-                if let Some(url) = pending_url.take() {
-                    let wait = Duration::from_secs(60);
-                    match deliver_when_listening(cli, layout, Some(url), wait) {
-                        Ok(()) => log.line("handed the link to Spark"),
-                        Err(e) => log.line(&format!("could not hand the link to Spark: {e}")),
-                    }
+                // Always reach Spark once: the hand-over also repairs `fetch`
+                // (see `inspect`), which sign-in needs even without a link.
+                let url = pending_url.take();
+                let wait = Duration::from_secs(60);
+                match (deliver_when_listening(cli, layout, url, wait), url) {
+                    (Ok(()), Some(_)) => log.line("handed the link to Spark"),
+                    (Ok(()), None) => log.line("prepared Spark for sign-in"),
+                    (Err(e), _) => log.line(&format!(
+                        "could not reach Spark after start (sign-in may fail): {e}"
+                    )),
                 }
             } else if vm::is_hung(policy, false, started.elapsed()) {
                 stopped_at = Some(Instant::now());
@@ -493,6 +497,18 @@ fn run(cli: &Cli) -> Result<(), String> {
                 // Spark may still be starting: keep trying until it listens.
                 let wait = Duration::from_secs(cli.ready_timeout);
                 let outcome = deliver_when_listening(cli, &layout, url, wait);
+                // The start it was waiting on died. The other launcher
+                // retries, so wait for that start instead of dropping a link.
+                if outcome.is_err()
+                    && url.is_some()
+                    && !vm_running(&layout.root)
+                    && Instant::now() < deadline
+                {
+                    log.line("Spark went away before it took the link: waiting for the next start");
+                    thread::sleep(Duration::from_secs(2));
+                    locked = lock.try_lock().is_ok();
+                    continue;
+                }
                 log.line(match &outcome {
                     Ok(()) => "Spark is running: handed over to it",
                     Err(_) => "Spark is running, but the hand-over failed",

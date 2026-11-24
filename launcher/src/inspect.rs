@@ -16,7 +16,9 @@ use std::time::Duration;
 const EXE_NAME: &str = "Spark Desktop.exe";
 /// Value the expression returns when Spark took the event.
 const DELIVERED: &str = "delivered";
-const TIMEOUT: Duration = Duration::from_secs(20);
+/// Per socket step. A delivery has five such steps, and the host stops
+/// waiting for the helper after 45 s, so five of these must stay below that.
+const TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Encode text as a JSON (and JavaScript) string literal.
 pub fn json_string(text: &str) -> String {
@@ -37,7 +39,18 @@ pub fn json_string(text: &str) -> String {
     out
 }
 
-/// JavaScript that raises Spark's `second-instance` event in the main process.
+/// `--jitless` removes WebAssembly, and Node's own `fetch` needs it for its
+/// HTTP parser. Every `fetch` in Spark's main process then fails, the OAuth
+/// token request after sign-in among them. This sends those calls through
+/// Chromium's network stack instead. It does nothing when WebAssembly exists
+/// or when it has already run.
+const FETCH_FIX: &str = "if (typeof WebAssembly === 'undefined' && !globalThis.__sparkArmFetch) { \
+     const { net } = require('electron'); \
+     globalThis.fetch = (input, init) => net.fetch(input, init); \
+     globalThis.__sparkArmFetch = true; }";
+
+/// JavaScript that raises Spark's `second-instance` event in the main process,
+/// after applying [`FETCH_FIX`].
 ///
 /// Spark does not read the event's argument list directly. A second instance
 /// adds `--second-instance=<its argv as JSON>`, and the first instance parses
@@ -49,8 +62,9 @@ pub fn delivery_expression(url: Option<&str>) -> String {
         forwarded.push(json_string(url));
     }
     format!(
-        "require('electron').app.emit('second-instance', {{}}, [process.execPath, \
-         '--second-instance=' + JSON.stringify([{}])], process.cwd()) ? '{DELIVERED}' : 'no-listener'",
+        "(() => {{ {FETCH_FIX} \
+         return require('electron').app.emit('second-instance', {{}}, [process.execPath, \
+         '--second-instance=' + JSON.stringify([{}])], process.cwd()) ? '{DELIVERED}' : 'no-listener'; }})()",
         forwarded.join(",")
     )
 }
@@ -230,6 +244,15 @@ mod tests {
         ));
         assert!(expr.contains("'--second-instance=' +"));
         assert!(delivery_expression(None).contains(r#"JSON.stringify(["Spark Desktop.exe"])"#));
+    }
+
+    #[test]
+    fn every_expression_repairs_fetch_before_the_event() {
+        let expr = delivery_expression(None);
+        let fix = expr.find("net.fetch(input, init)").unwrap();
+        assert!(expr.contains("typeof WebAssembly === 'undefined'"));
+        assert!(fix < expr.find("app.emit").unwrap());
+        assert!(expr.starts_with("(() => {") && expr.ends_with("})()"));
     }
 
     #[test]

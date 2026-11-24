@@ -309,6 +309,12 @@ schemes and `mailto`. Rerun it when the binary or the repository moves.
 - **Safe defaults:** `--disable-gpu`, because the GPU process crashes on most
   starts, and `--js-flags=--jitless`, because V8's JIT-compiled code crashes
   Spark under FEX within minutes. `--gpu` and `--jit` turn them back on.
+- **Sign-in with the JIT off:** `--jitless` also removes WebAssembly, which
+  Node's `fetch` needs. Spark's token request after an OAuth sign-in then
+  fails and the window stays on "Proceed in Browser". Once Spark is ready the
+  launcher points the main process's `fetch` at Chromium's network stack
+  (`net.fetch`) through the inspector. WebAssembly stays unavailable to the
+  rest of Spark.
 - **Retry:** many starts die within seconds (`GPU process isn't usable`,
   `Network service crashed`) and a few hang. The launcher waits for
   `Application bootstrap is completed` in the log. A start that dies first, or
