@@ -484,6 +484,28 @@ violation `0xc0000005` reading a heap address at `Spark Desktop.exe+0x2ddc057`.
 That address lies in the same region as the first dump's fault, and the stack
 again holds only `Spark Desktop.exe` frames.
 
+**With an account signed in, SparkCore dies on every start.** After the first
+completed sign-in, the SparkCore process (Electron's `NodeService` utility
+process) ended 30 to 70 seconds after the ready line on seven starts out of
+seven. Three endings were seen: access violation `0xc0000005` at
+`Spark Desktop.exe+0x2ddc057`, breakpoint `0x80000003` at
+`Spark Desktop.exe+0x2da0376`, and exit code 1 with no dump and no message.
+Both dump types share one call path: `node::MakeCallback`, `v8::Function::Call`,
+the interpreter entry, then a V8 builtin. In the access violation the builtin
+read the frame's bytecode array, which lay in a reserved but uncommitted part
+of V8's 1 GiB trusted range. Three things were ruled out:
+
+- Memory ordering. `prctl(PR_SET_MEM_MODEL, TSO)` succeeds inside the VM.
+- The JIT in SparkCore. `--js-flags` reaches only the main and renderer
+  processes. Patching `utilityProcess.fork` through the inspector to add
+  `--jitless` to SparkCore changed the ending from the access violation to
+  the breakpoint, on the same call path.
+- Bytecode flushing. `--no-flush-bytecode` in SparkCore gave exit code 1 after
+  44 seconds.
+
+The cause is not known. The Windows build is not usable on this stack once an
+account syncs.
+
 **`--jitless` breaks the OAuth token request.** V8 has no WebAssembly without
 a JIT (`--wasm-jitless` is not in this build), and Node's `fetch` loads its
 HTTP parser as WebAssembly. After the Google callback arrived, the main

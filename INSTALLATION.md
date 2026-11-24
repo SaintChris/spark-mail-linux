@@ -348,6 +348,9 @@ settings to FEX and to Spark for experiments.
 
 ### Limits on ARM
 
+- **Not usable for daily mail yet.** Sign-in completes, but once an account
+  syncs, Spark's SparkCore process dies 30 to 70 seconds after every start
+  and Spark quits. The cause is unknown; see `docs/investigation.md`.
 - Rendering is in software and JavaScript runs in V8's interpreter, so Spark
   is slower than on x86_64.
 - Startup takes minutes when starts have to be retried, and the VM needs
