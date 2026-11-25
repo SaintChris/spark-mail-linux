@@ -100,7 +100,11 @@ pub fn classify_target(target: &str) -> Option<HostTarget> {
             (!host.is_empty()).then(|| HostTarget::Web(target.to_owned()))
         }
         Some("file") => {
-            let path = percent_decode(target.get("file://".len()..)?)?;
+            let (prefix, rest) = target.split_at_checked("file://".len())?;
+            if !prefix.eq_ignore_ascii_case("file://") {
+                return None;
+            }
+            let path = percent_decode(rest)?;
             (path.starts_with('/') && !has_control_chars(&path))
                 .then(|| HostTarget::File(PathBuf::from(path)))
         }
@@ -179,7 +183,8 @@ pub fn drain(spool: &Path) -> io::Result<Vec<String>> {
 pub fn clear(spool: &Path) -> io::Result<()> {
     ensure_private_dir(spool)?;
     for entry in fs::read_dir(spool)?.filter_map(Result::ok) {
-        fs::remove_file(entry.path())?;
+        // A leftover that cannot be removed must not block the start.
+        let _ = fs::remove_file(entry.path());
     }
     Ok(())
 }

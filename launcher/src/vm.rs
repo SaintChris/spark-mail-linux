@@ -24,9 +24,8 @@ pub struct Layout {
     pub prefix: PathBuf,
     pub wine: PathBuf,
     pub mem_mib: u32,
-    pub gpu: bool,
-    /// Leave V8's JIT compilers on. Under FEX they crash Spark.
-    pub jit: bool,
+    /// How long a start may take to become ready.
+    pub ready_timeout: Duration,
     /// Loopback port inside the VM for Spark's Node inspector.
     pub inspect_port: u16,
     /// Extra environment for the guest, for example FEX settings.
@@ -76,6 +75,10 @@ impl Layout {
     pub fn deliveries(&self) -> PathBuf {
         self.tmp().join("deliveries")
     }
+    /// Outcome of the prepare helper for the current start.
+    pub fn prepare_result(&self) -> PathBuf {
+        self.tmp().join("prepare.result")
+    }
     pub fn wineserver(&self) -> PathBuf {
         self.wine.with_file_name("wineserver")
     }
@@ -110,15 +113,15 @@ fn guest_preamble(layout: &Layout) -> String {
 /// Arguments Spark itself receives. Links never go here: a command line is
 /// readable by other processes, so they are handed over once Spark is ready.
 pub fn spark_args(layout: &Layout) -> Vec<String> {
-    let mut args = Vec::new();
-    if !layout.gpu {
-        args.push("--disable-gpu".to_owned());
-    }
-    if !layout.jit {
-        args.push("--js-flags=--jitless".to_owned());
-    }
-    // The launcher hands links to Spark through this port. See `inspect.rs`.
-    args.push(format!("--inspect=127.0.0.1:{}", layout.inspect_port));
+    let mut args = vec![
+        // GPU acceleration is unstable under emulation.
+        "--disable-gpu".to_owned(),
+        // V8's JIT-compiled code crashes under FEX. SparkCore gets the same
+        // flag through `inspect::prepare`.
+        "--js-flags=--jitless".to_owned(),
+        // The launcher reaches Spark through this port. See `inspect.rs`.
+        format!("--inspect=127.0.0.1:{}", layout.inspect_port),
+    ];
     args.extend(layout.spark_args.iter().cloned());
     args
 }
@@ -136,12 +139,17 @@ fn wine_line(layout: &Layout) -> String {
     line
 }
 
-/// Script for the first launch. Output goes to the launch log, because muvm
-/// does not pass stdout back reliably.
-pub fn start_script(layout: &Layout) -> String {
+/// Script for the first launch. The launcher (`exe`) runs beside Spark as the
+/// prepare helper. The shell becomes Wine, so Wine is the helper's parent. Output goes to the launch log, because muvm does not pass
+/// stdout back reliably.
+pub fn start_script(layout: &Layout, exe: &Path) -> String {
     format!(
-        "{}exec {} </dev/null >{} 2>&1",
+        "{}{} {GUEST_PREPARE_FLAG} {} {} {} </dev/null >/dev/null 2>&1 & exec {} </dev/null >{} 2>&1",
         guest_preamble(layout),
+        sh_quote(&path_str(exe)),
+        layout.inspect_port,
+        layout.ready_timeout.as_secs(),
+        sh_quote(&path_str(&layout.prepare_result())),
         wine_line(layout),
         sh_quote(&path_str(&layout.launch_log()))
     )
@@ -180,6 +188,9 @@ pub fn muvm_args(layout: &Layout, command: &[String]) -> Vec<String> {
 pub fn fex_command(script: &str) -> Vec<String> {
     vec!["FEXBash".to_owned(), "-c".to_owned(), script.to_owned()]
 }
+
+/// Flag that makes the launcher act as the in-VM prepare helper.
+pub const GUEST_PREPARE_FLAG: &str = "--guest-prepare";
 
 /// Flag that makes the launcher act as the in-VM delivery helper.
 pub const GUEST_DELIVER_FLAG: &str = "--guest-deliver";
@@ -252,8 +263,6 @@ pub struct RetryPolicy {
     pub max_attempts: u32,
     /// A start that is not ready after this long is hung and gets stopped.
     pub ready_timeout: Duration,
-    /// Wait before the next start. Relaunching too fast fails again.
-    pub pause: Duration,
 }
 
 /// How one run of the VM ended.
@@ -334,8 +343,7 @@ mod tests {
             prefix: "/r/prefix".into(),
             wine: "/r/runtime/usr/bin/wine".into(),
             mem_mib: 5000,
-            gpu: false,
-            jit: false,
+            ready_timeout: Duration::from_secs(300),
             inspect_port: 9229,
             guest_env: Vec::new(),
             spark_args: Vec::new(),
@@ -345,7 +353,6 @@ mod tests {
     const POLICY: RetryPolicy = RetryPolicy {
         max_attempts: 3,
         ready_timeout: Duration::from_secs(300),
-        pause: Duration::from_secs(10),
     };
 
     const CRASHED: RunOutcome = RunOutcome {
@@ -381,13 +388,13 @@ mod tests {
     }
 
     #[test]
-    fn start_script_disables_gpu_and_logs_to_file() {
-        let script = start_script(&layout());
+    fn start_script_runs_the_helper_then_spark() {
+        let script = start_script(&layout(), Path::new("/r/.build/spark-arm"));
         assert!(script.contains("WINEPREFIX='/r/prefix'"));
         assert!(script.contains("PATH='/r/tmp/arm-host-tools':\"$PATH\""));
         assert!(script.contains("cd '/r/app' || exit 1; "));
         assert!(script.ends_with(
-            "exec '/r/runtime/usr/bin/wine' 'Spark Desktop.exe' '--disable-gpu' '--js-flags=--jitless' '--inspect=127.0.0.1:9229' </dev/null >'/r/tmp/launch.log' 2>&1"
+            "cd '/r/app' || exit 1; '/r/.build/spark-arm' --guest-prepare 9229 300 '/r/tmp/prepare.result' </dev/null >/dev/null 2>&1 & exec '/r/runtime/usr/bin/wine' 'Spark Desktop.exe' '--disable-gpu' '--js-flags=--jitless' '--inspect=127.0.0.1:9229' </dev/null >'/r/tmp/launch.log' 2>&1"
         ));
     }
 
@@ -402,18 +409,26 @@ mod tests {
         assert!(parse_guest_env("=1").is_err());
         let mut layout = layout();
         layout.guest_env = vec![("A_B".to_owned(), "it's".to_owned())];
-        assert!(start_script(&layout).starts_with(r"export A_B='it'\''s'; export SPARK_ROOT="));
+        assert!(
+            start_script(&layout, Path::new("/x"))
+                .starts_with(r"export A_B='it'\''s'; export SPARK_ROOT=")
+        );
     }
 
     #[test]
-    fn gpu_and_jit_flags_drop_the_safe_defaults() {
+    fn extra_spark_args_come_last() {
         let mut layout = layout();
-        layout.gpu = true;
-        layout.jit = true;
         layout.inspect_port = 9300;
-        assert_eq!(spark_args(&layout), ["--inspect=127.0.0.1:9300"]);
         layout.spark_args = vec!["--x".to_owned()];
-        assert_eq!(spark_args(&layout), ["--inspect=127.0.0.1:9300", "--x"]);
+        assert_eq!(
+            spark_args(&layout),
+            [
+                "--disable-gpu",
+                "--js-flags=--jitless",
+                "--inspect=127.0.0.1:9300",
+                "--x"
+            ]
+        );
     }
 
     #[test]

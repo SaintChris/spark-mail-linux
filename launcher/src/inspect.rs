@@ -1,4 +1,7 @@
-//! Hand a URL to the running Spark through its Node inspector.
+//! Talk to Spark's main process through its Node inspector.
+//!
+//! Two jobs. [`prepare`] runs once, early in every start, and makes Spark
+//! work with V8's JIT off. [`deliver`] hands a URL to the running Spark.
 //!
 //! On x86_64 hosts a second `Spark Desktop.exe` passes its arguments to the
 //! first instance and exits. Under FEX that second process makes the first
@@ -10,12 +13,15 @@
 
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Executable name Spark sees in the forwarded argument list.
 const EXE_NAME: &str = "Spark Desktop.exe";
 /// Value the expression returns when Spark took the event.
 const DELIVERED: &str = "delivered";
+/// Values [`PREPARE`] returns.
+const PREPARED: &str = "prepared";
+const TOO_LATE: &str = "late";
 /// Per socket step. A delivery has five such steps, and the host stops
 /// waiting for the helper after 45 s, so five of these must stay below that.
 const TIMEOUT: Duration = Duration::from_secs(8);
@@ -39,18 +45,31 @@ pub fn json_string(text: &str) -> String {
     out
 }
 
-/// `--jitless` removes WebAssembly, and Node's own `fetch` needs it for its
-/// HTTP parser. Every `fetch` in Spark's main process then fails, the OAuth
-/// token request after sign-in among them. This sends those calls through
-/// Chromium's network stack instead. It does nothing when WebAssembly exists
-/// or when it has already run.
-const FETCH_FIX: &str = "if (typeof WebAssembly === 'undefined' && !globalThis.__sparkArmFetch) { \
-     const { net } = require('electron'); \
-     globalThis.fetch = (input, init) => net.fetch(input, init); \
-     globalThis.__sparkArmFetch = true; }";
+/// Runs in Spark's main process before it starts SparkCore, its mail process.
+///
+/// 1. `--js-flags=--jitless` reaches only the main process and the windows.
+///    SparkCore is a separate Node process, and V8 flags reach it only through
+///    `execArgv` when it is forked. With its JIT on, V8 aborts in it under FEX.
+/// 2. `--jitless` removes WebAssembly, which Node's own `fetch` needs for its
+///    HTTP parser. The OAuth token request after sign-in then fails, so `fetch`
+///    goes through Chromium's network stack instead.
+///
+/// It throws until Electron's `require` exists, and the caller tries again.
+/// It answers [`TOO_LATE`] when SparkCore was already running.
+const PREPARE: &str = "(() => { \
+     const { app, net, utilityProcess } = require('electron'); \
+     if (globalThis.__sparkArm) return globalThis.__sparkArm; \
+     let late = false; \
+     try { late = app.getAppMetrics().some((p) => p.serviceName === 'node.mojom.NodeService'); } catch (e) {} \
+     if (typeof WebAssembly === 'undefined') globalThis.fetch = (input, init) => net.fetch(input, init); \
+     const fork = utilityProcess.fork; \
+     utilityProcess.fork = function (path, args, options) { \
+       const execArgv = [...((options && options.execArgv) || []), '--jitless']; \
+       return fork.call(this, path, args, { ...options, execArgv }); }; \
+     globalThis.__sparkArm = late ? 'late' : 'prepared'; \
+     return globalThis.__sparkArm; })()";
 
-/// JavaScript that raises Spark's `second-instance` event in the main process,
-/// after applying [`FETCH_FIX`].
+/// JavaScript that raises Spark's `second-instance` event in the main process.
 ///
 /// Spark does not read the event's argument list directly. A second instance
 /// adds `--second-instance=<its argv as JSON>`, and the first instance parses
@@ -62,7 +81,7 @@ pub fn delivery_expression(url: Option<&str>) -> String {
         forwarded.push(json_string(url));
     }
     format!(
-        "(() => {{ {FETCH_FIX} \
+        "(() => {{ \
          return require('electron').app.emit('second-instance', {{}}, [process.execPath, \
          '--second-instance=' + JSON.stringify([{}])], process.cwd()) ? '{DELIVERED}' : 'no-listener'; }})()",
         forwarded.join(",")
@@ -136,9 +155,9 @@ pub fn read_frame(stream: &mut impl Read) -> io::Result<Vec<u8>> {
     Ok(payload)
 }
 
-/// True when the inspector's reply says Spark took the event.
-pub fn reply_delivered(reply: &str) -> bool {
-    reply.contains(&format!("\"value\":\"{DELIVERED}\""))
+/// True when the inspector's reply carries this string value.
+pub fn reply_has_value(reply: &str, value: &str) -> bool {
+    reply.contains(&format!("\"value\":\"{value}\""))
 }
 
 fn connect(port: u16) -> io::Result<TcpStream> {
@@ -188,9 +207,9 @@ fn target_path(port: u16) -> io::Result<String> {
         .ok_or_else(|| io::Error::other("no debugging target in the reply"))
 }
 
-/// Deliver a URL (or a plain "show the window") to Spark on the local
-/// inspector port. Must run inside the VM, where that port listens.
-pub fn deliver(port: u16, url: Option<&str>) -> io::Result<()> {
+/// Evaluate one expression in Spark's main process and return the raw reply.
+/// Must run inside the VM, where the inspector port listens.
+fn evaluate(port: u16, expression: &str) -> io::Result<String> {
     let path = target_path(port)?;
     let mut stream = connect(port)?;
     // The key only has to be 16 base64-encoded bytes; this is RFC 6455's sample.
@@ -204,17 +223,44 @@ pub fn deliver(port: u16, url: Option<&str>) -> io::Result<()> {
     if !head.starts_with("HTTP/1.1 101") {
         return Err(io::Error::other("the inspector refused the connection"));
     }
-    let request = evaluate_request(&delivery_expression(url));
+    let request = evaluate_request(expression);
     // Masking guards browsers against proxies; on loopback the value is irrelevant.
     stream.write_all(&text_frame(
         request.as_bytes(),
         std::process::id().to_be_bytes(),
     ))?;
     let reply = read_frame(&mut stream)?;
-    if reply_delivered(&String::from_utf8_lossy(&reply)) {
+    Ok(String::from_utf8_lossy(&reply).into_owned())
+}
+
+/// Deliver a URL (or a plain "show the window") to Spark.
+pub fn deliver(port: u16, url: Option<&str>) -> io::Result<()> {
+    let reply = evaluate(port, &delivery_expression(url))?;
+    if reply_has_value(&reply, DELIVERED) {
         Ok(())
     } else {
         Err(io::Error::other("Spark did not take the event"))
+    }
+}
+
+/// Apply [`PREPARE`] as soon as Spark's main process can take it, trying
+/// until `wait` has passed or `spark_alive` says Spark is gone. Spark opens
+/// the inspector a few seconds after it starts and forks SparkCore a few
+/// seconds later, so this polls quickly.
+pub fn prepare(port: u16, wait: Duration, spark_alive: impl Fn() -> bool) -> io::Result<()> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match evaluate(port, PREPARE) {
+            Ok(reply) if reply_has_value(&reply, PREPARED) => return Ok(()),
+            Ok(reply) if reply_has_value(&reply, TOO_LATE) => {
+                return Err(io::Error::other("SparkCore had already started"));
+            }
+            _ if !spark_alive() => return Err(io::Error::other("Spark exited first")),
+            _ if Instant::now() > deadline => {
+                return Err(io::Error::other("Spark's inspector never took the request"));
+            }
+            _ => std::thread::sleep(Duration::from_millis(200)),
+        }
     }
 }
 
@@ -247,12 +293,12 @@ mod tests {
     }
 
     #[test]
-    fn every_expression_repairs_fetch_before_the_event() {
-        let expr = delivery_expression(None);
-        let fix = expr.find("net.fetch(input, init)").unwrap();
-        assert!(expr.contains("typeof WebAssembly === 'undefined'"));
-        assert!(fix < expr.find("app.emit").unwrap());
-        assert!(expr.starts_with("(() => {") && expr.ends_with("})()"));
+    fn prepare_turns_the_jit_off_in_sparkcore_and_repairs_fetch() {
+        assert!(PREPARE.contains("'--jitless'"));
+        assert!(PREPARE.contains("utilityProcess.fork = function"));
+        assert!(PREPARE.contains("net.fetch(input, init)"));
+        assert!(PREPARE.contains("typeof WebAssembly === 'undefined'"));
+        assert!(PREPARE.starts_with("(() => {") && PREPARE.ends_with("})()"));
     }
 
     #[test]
@@ -339,6 +385,37 @@ mod tests {
         let request = server.join().unwrap();
         assert!(request.contains("Runtime.evaluate"));
         assert!(request.contains("mailto:a@example.com"));
+    }
+
+    #[test]
+    fn prepare_reports_a_late_start() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = fake_inspector(listener, "late");
+        assert!(prepare(port, Duration::from_secs(5), || true).is_err());
+        assert!(server.join().unwrap().contains("--jitless"));
+    }
+
+    #[test]
+    fn prepare_succeeds_once_spark_answers() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = fake_inspector(listener, "prepared");
+        prepare(port, Duration::from_secs(5), || true).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn prepare_stops_when_spark_is_gone() {
+        // Nothing listens on this port once the listener is dropped.
+        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let started = Instant::now();
+        assert!(prepare(port, Duration::from_secs(60), || false).is_err());
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 
     #[test]

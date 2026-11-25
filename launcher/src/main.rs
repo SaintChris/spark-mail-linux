@@ -37,16 +37,9 @@ struct Cli {
     wine: Option<PathBuf>,
 
     /// VM memory limit in MiB. The VM takes memory only as it needs it.
-    #[arg(long, env = "SPARK_VM_MEM", default_value_t = 6000)]
+    /// Spark needs about 6.2 GB; a lower limit gets its processes killed.
+    #[arg(long, env = "SPARK_VM_MEM", default_value_t = 9000)]
     mem: u32,
-
-    /// Leave GPU acceleration on. It is unstable under emulation.
-    #[arg(long, env = "SPARK_GPU")]
-    gpu: bool,
-
-    /// Leave V8's JIT compilers on. Spark crashes with them under FEX.
-    #[arg(long, env = "SPARK_JIT")]
-    jit: bool,
 
     /// Port inside the VM for Spark's Node inspector, which takes forwarded links.
     #[arg(long, env = "SPARK_INSPECT_PORT", default_value_t = 9229)]
@@ -55,10 +48,6 @@ struct Cli {
     /// Starts allowed when Spark dies during startup, including the first.
     #[arg(long, env = "SPARK_START_ATTEMPTS", default_value_t = 3)]
     attempts: u32,
-
-    /// Seconds to wait before a retry.
-    #[arg(long, default_value_t = 10)]
-    retry_pause: u64,
 
     /// Seconds a start may take to become ready before it is stopped and retried.
     #[arg(long, env = "SPARK_READY_TIMEOUT", default_value_t = 300)]
@@ -134,8 +123,7 @@ fn layout(cli: &Cli) -> Result<Layout, String> {
         prefix,
         wine,
         mem_mib: cli.mem,
-        gpu: cli.gpu,
-        jit: cli.jit,
+        ready_timeout: Duration::from_secs(cli.ready_timeout),
         inspect_port: cli.inspect_port,
         guest_env: cli.guest_env.clone(),
         spark_args: cli.spark_args.clone(),
@@ -253,13 +241,19 @@ fn run_vm_once(
 ) -> Result<RunOutcome, String> {
     links::clear(&layout.spool()).map_err(|e| format!("spool: {e}"))?;
     let _ = fs::remove_file(layout.launch_log());
+    let _ = fs::remove_file(layout.prepare_result());
+    let exe = std::env::current_exe().map_err(|e| format!("cannot find own path: {e}"))?;
     let muvm_stderr = File::create(muvm_log(layout)).map_err(|e| format!("muvm log: {e}"))?;
     let started = Instant::now();
-    let mut child = muvm(cli, layout, &vm::fex_command(&vm::start_script(layout)))
-        .stdout(Stdio::null())
-        .stderr(muvm_stderr)
-        .spawn()
-        .map_err(|e| format!("cannot run {}: {e}", cli.muvm.display()))?;
+    let mut child = muvm(
+        cli,
+        layout,
+        &vm::fex_command(&vm::start_script(layout, &exe)),
+    )
+    .stdout(Stdio::null())
+    .stderr(muvm_stderr)
+    .spawn()
+    .map_err(|e| format!("cannot run {}: {e}", cli.muvm.display()))?;
     let mut ready = false;
     let mut stopped_at: Option<Instant> = None;
     let mut ticks = 0u32;
@@ -282,16 +276,19 @@ fn run_vm_once(
                     "Spark is ready after {} s",
                     started.elapsed().as_secs()
                 ));
-                // Always reach Spark once: the hand-over also repairs `fetch`
-                // (see `inspect`), which sign-in needs even without a link.
-                let url = pending_url.take();
-                let wait = Duration::from_secs(60);
-                match (deliver_when_listening(cli, layout, url, wait), url) {
-                    (Ok(()), Some(_)) => log.line("handed the link to Spark"),
-                    (Ok(()), None) => log.line("prepared Spark for sign-in"),
-                    (Err(e), _) => log.line(&format!(
-                        "could not reach Spark after start (sign-in may fail): {e}"
+                match fs::read_to_string(layout.prepare_result()).as_deref() {
+                    Ok("ok") => {}
+                    Ok(problem) => log.line(&format!(
+                        "could not prepare Spark (it may crash or fail to sign in): {problem}"
                     )),
+                    Err(_) => log.line("the prepare helper has not answered yet"),
+                }
+                if let Some(url) = pending_url.take() {
+                    let wait = Duration::from_secs(60);
+                    match deliver_when_listening(cli, layout, Some(url), wait) {
+                        Ok(()) => log.line("handed the link to Spark"),
+                        Err(e) => log.line(&format!("could not hand the link to Spark: {e}")),
+                    }
                 }
             } else if vm::is_hung(policy, false, started.elapsed()) {
                 stopped_at = Some(Instant::now());
@@ -331,8 +328,7 @@ fn start(cli: &Cli, layout: &Layout, url: Option<&str>, log: &Log) -> Result<(),
     }
     let policy = RetryPolicy {
         max_attempts: cli.attempts.max(1),
-        ready_timeout: Duration::from_secs(cli.ready_timeout),
-        pause: Duration::from_secs(cli.retry_pause),
+        ready_timeout: layout.ready_timeout,
     };
     let _ = fs::remove_file(layout.stop_flag());
     let mut pending_url = url;
@@ -358,7 +354,8 @@ fn start(cli: &Cli, layout: &Layout, url: Option<&str>, log: &Log) -> Result<(),
         if !vm::should_retry(&policy, attempt, &outcome) {
             break;
         }
-        thread::sleep(policy.pause);
+        // Relaunching at once fails again.
+        thread::sleep(Duration::from_secs(10));
     }
     Err(format!(
         "Spark failed to start {} times. See {} and {}",
@@ -549,6 +546,40 @@ fn guest_open() -> ExitCode {
     }
 }
 
+/// Runs inside the VM beside Spark: `--guest-prepare PORT SECONDS RESULT`.
+/// Applies `inspect::prepare` and records the outcome for the launcher's log.
+fn guest_prepare(args: &[String]) -> ExitCode {
+    let [port, seconds, result] = args else {
+        eprintln!(
+            "spark-arm: {} needs PORT SECONDS RESULT",
+            vm::GUEST_PREPARE_FLAG
+        );
+        return ExitCode::from(2);
+    };
+    // Spark is this helper's parent. When it exits the helper gets a new
+    // parent and must stop, or it would keep the VM up.
+    let spark = std::os::unix::process::parent_id();
+    let spark_alive = || std::os::unix::process::parent_id() == spark;
+    let outcome = port
+        .parse::<u16>()
+        .and_then(|port| Ok((port, seconds.parse::<u64>()?)))
+        .map_err(|e| e.to_string())
+        .and_then(|(port, seconds)| {
+            inspect::prepare(port, Duration::from_secs(seconds), spark_alive)
+                .map_err(|e| e.to_string())
+        });
+    let text = match &outcome {
+        Ok(()) => "ok".to_owned(),
+        Err(e) => e.clone(),
+    };
+    let written = links::write_private(Path::new(result), &text);
+    if outcome.is_ok() && written.is_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 /// Runs inside the VM: `--guest-deliver PORT REQUEST RESULT`. Reads the link,
 /// removes the file, hands the link to Spark and records the outcome.
 fn guest_deliver(args: &[String]) -> ExitCode {
@@ -589,8 +620,10 @@ fn main() -> ExitCode {
         .skip(1)
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-    if args.first().map(String::as_str) == Some(vm::GUEST_DELIVER_FLAG) {
-        return guest_deliver(&args[1..]);
+    match args.first().map(String::as_str) {
+        Some(vm::GUEST_PREPARE_FLAG) => return guest_prepare(&args[1..]),
+        Some(vm::GUEST_DELIVER_FLAG) => return guest_deliver(&args[1..]),
+        _ => {}
     }
     let invoked_as = std::env::args_os().next().map(PathBuf::from);
     if invoked_as.as_deref().and_then(Path::file_name) == Some("xdg-open".as_ref()) {

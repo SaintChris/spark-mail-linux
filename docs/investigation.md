@@ -484,27 +484,40 @@ violation `0xc0000005` reading a heap address at `Spark Desktop.exe+0x2ddc057`.
 That address lies in the same region as the first dump's fault, and the stack
 again holds only `Spark Desktop.exe` frames.
 
-**With an account signed in, SparkCore dies on every start.** After the first
+**With an account signed in, SparkCore died on every start (fixed).** After the first
 completed sign-in, the SparkCore process (Electron's `NodeService` utility
 process) ended 30 to 70 seconds after the ready line on seven starts out of
 seven. Three endings were seen: access violation `0xc0000005` at
 `Spark Desktop.exe+0x2ddc057`, breakpoint `0x80000003` at
 `Spark Desktop.exe+0x2da0376`, and exit code 1 with no dump and no message.
-Both dump types share one call path: `node::MakeCallback`, `v8::Function::Call`,
-the interpreter entry, then a V8 builtin. In the access violation the builtin
-read the frame's bytecode array, which lay in a reserved but uncommitted part
-of V8's 1 GiB trusted range. Three things were ruled out:
+Two causes were found, and both needed a fix.
 
-- Memory ordering. `prctl(PR_SET_MEM_MODEL, TSO)` succeeds inside the VM.
-- The JIT in SparkCore. `--js-flags` reaches only the main and renderer
-  processes. Patching `utilityProcess.fork` through the inspector to add
-  `--jitless` to SparkCore changed the ending from the access violation to
-  the breakpoint, on the same call path.
-- Bytecode flushing. `--no-flush-bytecode` in SparkCore gave exit code 1 after
-  44 seconds.
+1. *The VM ran out of memory.* The launcher capped the VM at 6000 MiB. With an
+   account syncing, the main, SparkCore and window processes hold 1.2 to
+   1.5 GB each and the whole VM about 6.2 GB. The guest kernel log, read as
+   root inside the VM (`muvm --privileged -m -- dmesg`), showed
+   `Out of memory: Killed process` for a Spark process at the moment Spark
+   died. A process killed this way runs no JavaScript and writes no dump,
+   which is the "exit code 1 with no message" ending: hooks installed in
+   SparkCore on `process.exit`, `process.reallyExit` and
+   `uncaughtExceptionMonitor` recorded nothing. With `--mem 9500` memory
+   stayed flat at 6.1 to 6.2 GB and the same build ran three minutes instead
+   of one.
+2. *V8's JIT in SparkCore.* With enough memory, SparkCore still ended after
+   about three minutes with breakpoint `0x80000003` inside
+   `v8::internal::ThreadIsolation::StartOfJitAllocationAt`, a failed check in
+   V8's bookkeeping of JIT code pages. `--js-flags` reaches only the main and
+   window processes, and `NODE_OPTIONS=--jitless` is ignored by SparkCore
+   (WebAssembly stayed defined in it). Adding `--jitless` to the `execArgv` of
+   `utilityProcess.fork` through the main inspector, before SparkCore is
+   forked, does reach it.
 
-The cause is not known. The Windows build is not usable on this stack once an
-account syncs.
+With both fixes Spark stayed up with the account syncing and the window
+mapped for 11 minutes, across a suspend and resume of the host, until it was
+stopped by hand. An earlier test of `--jitless` in SparkCore alone failed
+because the VM was still short of memory. The earlier access violations in
+V8 builtins were not seen again; whether memory pressure or the JIT caused
+them was not separated.
 
 **`--jitless` breaks the OAuth token request.** V8 has no WebAssembly without
 a JIT (`--wasm-jitless` is not in this build), and Node's `fetch` loads its

@@ -306,15 +306,20 @@ schemes and `mailto`. Rerun it when the binary or the repository moves.
 
 - **Start:** `muvm -m` with the bundled Wine. Output goes to `tmp/launch.log`.
   The window appears one to two minutes after the start.
-- **Safe defaults:** `--disable-gpu`, because the GPU process crashes on most
-  starts, and `--js-flags=--jitless`, because V8's JIT-compiled code crashes
-  Spark under FEX within minutes. `--gpu` and `--jit` turn them back on.
-- **Sign-in with the JIT off:** `--jitless` also removes WebAssembly, which
-  Node's `fetch` needs. Spark's token request after an OAuth sign-in then
-  fails and the window stays on "Proceed in Browser". Once Spark is ready the
-  launcher points the main process's `fetch` at Chromium's network stack
-  (`net.fetch`) through the inspector. WebAssembly stays unavailable to the
-  rest of Spark.
+- **Fixed switches:** `--disable-gpu`, because the GPU process crashes on
+  most starts, and `--js-flags=--jitless`, because V8's JIT-compiled code
+  crashes Spark under FEX within minutes.
+- **Prepare step:** `--js-flags` does not reach SparkCore, Spark's mail
+  process, and `--jitless` removes WebAssembly, which Node's `fetch` needs
+  for the token request after an OAuth sign-in. So the start script runs
+  `spark-arm` beside Spark as a native helper. Before Spark starts SparkCore,
+  the helper uses the inspector to add `--jitless` to SparkCore's start and to
+  point the main process's `fetch` at Chromium's network stack (`net.fetch`).
+  The outcome is in `tmp/prepare.result`; anything but `ok` is also written
+  to the launcher log. WebAssembly stays unavailable to the rest of Spark.
+- **Memory:** the VM may use up to 9000 MiB (`--mem`, `SPARK_VM_MEM`). Spark
+  holds about 6.2 GB once an account syncs. Under a lower limit the VM's
+  kernel kills Spark's processes about a minute after each start.
 - **Retry:** many starts die within seconds (`GPU process isn't usable`,
   `Network service crashed`) and a few hang. The launcher waits for
   `Application bootstrap is completed` in the log. A start that dies first, or
@@ -342,15 +347,11 @@ The inspector port listens on the loopback interface inside the VM only.
 Any process inside that VM can control Spark through it, so run nothing else
 in the VM. Change the port with `--inspect-port`.
 
-Settings: `spark-arm --help`. `--mem` (or `SPARK_VM_MEM`) caps the VM's
-memory in MiB. `--guest-env KEY=VALUE` and `--spark-arg ARG` pass extra
+Settings: `spark-arm --help`. `--guest-env KEY=VALUE` and `--spark-arg ARG` pass extra
 settings to FEX and to Spark for experiments.
 
 ### Limits on ARM
 
-- **Not usable for daily mail yet.** Sign-in completes, but once an account
-  syncs, Spark's SparkCore process dies 30 to 70 seconds after every start
-  and Spark quits. The cause is unknown; see `docs/investigation.md`.
 - Rendering is in software and JavaScript runs in V8's interpreter, so Spark
   is slower than on x86_64.
 - Startup takes minutes when starts have to be retried, and the VM needs
@@ -358,8 +359,9 @@ settings to FEX and to Spark for experiments.
 - There is no Bubblewrap container. Wine sees the real home directory.
 - muvm runs one VM per user. The launcher refuses to start while another
   muvm VM is running, for example one started for Steam.
-- With the VM capped at 6000 MiB, Spark used almost all of it while idle on
-  the welcome screen. Plan for about 6 GB of host memory.
+- Plan for about 6.5 GB of free host memory. Each Spark process takes 1.2 to
+  1.5 GB under emulation.
+- If Spark ends after it was ready, the launcher does not start it again.
 - The notification watcher, tray closer, clipboard image bridge, window
   rescue, `bin/spark` and `update-spark.sh` are untested under muvm and are
   not started by `spark-arm`.
